@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""
+Species Identification Agent
+----------------------------
+Give it a photo of an animal / plant / fungus and it returns:
+  - common name
+  - scientific (species) name
+  - genus, family, order, class, phylum, kingdom
+  - confidence score + top-k alternatives
+
+Model: BioCLIP (via `pybioclip`) - a vision model trained on the Tree of Life
+(TreeOfLife-10M, ~450k taxa). It does zero-shot classification against
+pre-computed text embeddings, so there is no per-taxon training or search loop.
+
+Install:
+    pip install pybioclip pillow
+    pip install gradio        # optional, only for --ui
+
+Usage:
+    python species_agent.py photo.jpg
+    python species_agent.py img1.jpg img2.png --top-k 5
+    python species_agent.py photos_folder/ --json
+    python species_agent.py --ui                     # web interface
+
+Efficiency notes:
+    * Model is loaded once (singleton) and reused  -> no reload cost.
+    * Taxon text embeddings are pre-computed/cached by pybioclip.
+    * Inference runs under torch.inference_mode() on GPU if available.
+    * Per-image cost is one forward pass of the image encoder plus one
+      matrix multiply against the cached taxon embeddings: effectively
+      constant time for a fixed model.
+    * Results are cached per file (path + mtime), so repeats are instant.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass, asdict, field
+from functools import lru_cache
+from pathlib import Path
+from typing import Iterable
+
+from PIL import Image, UnidentifiedImageError
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+LOW_CONFIDENCE = 0.30  # below this, the agent warns the result is uncertain
+
+
+# --------------------------------------------------------------------------- #
+# Data model
+# --------------------------------------------------------------------------- #
+@dataclass
+class Prediction:
+    common_name: str
+    species: str
+    genus: str
+    family: str
+    order: str
+    class_: str
+    phylum: str
+    kingdom: str
+    confidence: float
+
+    @property
+    def organism_type(self) -> str:
+        k = self.kingdom.lower()
+        return {"animalia": "Animal", "plantae": "Plant", "fungi": "Fungus"}.get(k, k.title() or "Unknown")
+
+
+@dataclass
+class Result:
+    file: str
+    best: Prediction | None = None
+    alternatives: list[Prediction] = field(default_factory=list)
+    warning: str = ""
+    error: str = ""
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        if self.best:
+            d["best"]["organism_type"] = self.best.organism_type
+        return d
+
+
+# --------------------------------------------------------------------------- #
+# Model (loaded once)
+# --------------------------------------------------------------------------- #
+@lru_cache(maxsize=1)
+def _classifier():
+    try:
+        import torch
+        from bioclip import TreeOfLifeClassifier
+    except ImportError:
+        sys.exit("Missing dependencies. Run: pip install pybioclip pillow")
+
+    device = "cuda" if torch.cuda.is_available() else (
+        "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
+    )
+    try:
+        return TreeOfLifeClassifier(device=device)
+    except TypeError:  # older pybioclip versions have no `device` arg
+        return TreeOfLifeClassifier()
+
+
+def _to_prediction(raw: dict) -> Prediction:
+    g = lambda *keys: next((str(raw[k]) for k in keys if raw.get(k)), "")
+    genus = g("genus")
+    species = g("species")
+    epithet = g("species_epithet")
+    if species and genus and not species.startswith(genus):
+        species = f"{genus} {species}"
+    elif not species and genus and epithet:
+        species = f"{genus} {epithet}"
+    return Prediction(
+        common_name=g("common_name") or "(no common name)",
+        species=species,
+        genus=genus,
+        family=g("family"),
+        order=g("order"),
+        class_=g("class"),
+        phylum=g("phylum"),
+        kingdom=g("kingdom"),
+        confidence=round(float(raw.get("score", 0.0)), 4),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Core API
+# --------------------------------------------------------------------------- #
+@lru_cache(maxsize=512)
+def _identify_cached(path: str, mtime: float, top_k: int) -> Result:
+    result = Result(file=path)
+    try:
+        with Image.open(path) as im:
+            im.verify()  # fast integrity check
+    except (UnidentifiedImageError, OSError) as e:
+        result.error = f"Not a valid image: {e}"
+        return result
+
+    try:
+        from bioclip import Rank
+        import torch
+
+        with torch.inference_mode():
+            raw = _classifier().predict(path, Rank.SPECIES, k=top_k)
+    except Exception as e:  # keep the agent alive on any model error
+        result.error = f"Inference failed: {e}"
+        return result
+
+    preds = sorted((_to_prediction(r) for r in raw), key=lambda p: p.confidence, reverse=True)
+    if not preds:
+        result.error = "No prediction returned."
+        return result
+
+    result.best, result.alternatives = preds[0], preds[1:]
+    if result.best.confidence < LOW_CONFIDENCE:
+        result.warning = (
+            "Low confidence. Try a clearer, closer, well-lit photo with the "
+            "organism centred (for plants: include leaves/flowers)."
+        )
+    return result
+
+
+def identify(path: str | Path, top_k: int = 5) -> Result:
+    """Identify the organism in a single image file."""
+    p = Path(path)
+    if not p.is_file():
+        return Result(file=str(p), error="File not found.")
+    return _identify_cached(str(p.resolve()), p.stat().st_mtime, top_k)
+
+
+def identify_many(paths: Iterable[str | Path], top_k: int = 5) -> list[Result]:
+    return [identify(p, top_k) for p in paths]
+
+
+def collect_images(inputs: list[str]) -> list[Path]:
+    files: list[Path] = []
+    for item in inputs:
+        p = Path(item)
+        if p.is_dir():
+            files += sorted(f for f in p.iterdir() if f.suffix.lower() in IMAGE_EXTS)
+        else:
+            files.append(p)
+    return files
+
+
+# --------------------------------------------------------------------------- #
+# Pretty printing
+# --------------------------------------------------------------------------- #
+def format_result(r: Result) -> str:
+    if r.error:
+        return f"[{r.file}]\n  ERROR: {r.error}\n"
+    b = r.best
+    lines = [
+        f"[{r.file}]",
+        f"  Type        : {b.organism_type}",
+        f"  Common name : {b.common_name}",
+        f"  Species     : {b.species}",
+        f"  Genus       : {b.genus}",
+        f"  Family      : {b.family}",
+        f"  Order       : {b.order}",
+        f"  Class       : {b.class_}",
+        f"  Phylum      : {b.phylum}",
+        f"  Kingdom     : {b.kingdom}",
+        f"  Confidence  : {b.confidence:.1%}",
+    ]
+    if r.warning:
+        lines.append(f"  WARNING     : {r.warning}")
+    if r.alternatives:
+        lines.append("  Other candidates:")
+        for a in r.alternatives:
+            lines.append(f"    - {a.species} ({a.common_name}) {a.confidence:.1%}")
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# Optional web UI
+# --------------------------------------------------------------------------- #
+def launch_ui(top_k: int) -> None:
+    try:
+        import gradio as gr
+    except ImportError:
+        sys.exit("Install gradio first: pip install gradio")
+
+    def run(img_path):
+        if img_path is None:
+            return "Upload a photo first."
+        return format_result(identify(img_path, top_k))
+
+    gr.Interface(
+        fn=run,
+        inputs=gr.Image(type="filepath", label="Photo of an animal / plant"),
+        outputs=gr.Textbox(label="Identification", lines=20),
+        title="Species Identification Agent",
+        description="Upload a photo to get the species, genus and common name.",
+    ).launch()
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Identify animals/plants from photos.")
+    ap.add_argument("inputs", nargs="*", help="image files or folders")
+    ap.add_argument("--top-k", type=int, default=5, help="number of candidates (default 5)")
+    ap.add_argument("--json", action="store_true", help="output JSON")
+    ap.add_argument("--ui", action="store_true", help="launch web interface")
+    args = ap.parse_args()
+
+    if args.ui:
+        return launch_ui(args.top_k)
+    if not args.inputs:
+        ap.error("provide at least one image/folder, or use --ui")
+
+    files = collect_images(args.inputs)
+    if not files:
+        sys.exit("No images found.")
+
+    results = identify_many(files, args.top_k)
+    if args.json:
+        print(json.dumps([r.to_dict() for r in results], indent=2))
+    else:
+        print("\n".join(format_result(r) for r in results))
+
+
+if __name__ == "__main__":
+    main()
