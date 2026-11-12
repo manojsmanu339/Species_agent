@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+*.tmp.npz
+# your private/large datasets (keep only the template)
+train_data/
+test_data/
+# The learned knowledge file IS meant to be committed (small). Remove next line to ignore it.
+!knowledge/knowledge.npz

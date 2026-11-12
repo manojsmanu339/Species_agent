@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "species-agent"
+version = "1.0.0"
+description = "Identify animals and plants from photos; keeps learning from your labelled examples."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "pybioclip>=1.0",
+  "open_clip_torch",
+  "torch",
+  "numpy",
+  "pillow",
+]
+
+[project.optional-dependencies]
+ui = ["gradio"]
+web = ["fastapi", "uvicorn[standard]", "python-multipart", "requests"]
+dev = ["pytest", "httpx", "fastapi", "python-multipart", "requests"]
+
+[project.scripts]
+species-agent = "species_agent.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["species_agent*"]
+
+[tool.setuptools.package-data]
+species_agent = ["web/**/*"]

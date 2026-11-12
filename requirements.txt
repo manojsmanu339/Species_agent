@@ -1,0 +1,10 @@
+pybioclip
+open_clip_torch
+torch
+numpy
+pillow
+fastapi
+uvicorn[standard]
+python-multipart
+requests
+gradio
